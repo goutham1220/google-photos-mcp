@@ -61,7 +61,11 @@ const config = {
      * OAuth scopes required by the application.
      * Note: Access may be limited to app-created content after March 31, 2025 due to API changes.
      */
-    scopes: [
+    // Override the granted scopes via GOOGLE_OAUTH_SCOPES (comma-separated) to,
+    // e.g., mint a read-only consent for a hardened cloud deployment.
+    scopes: process.env.GOOGLE_OAUTH_SCOPES?.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean) ?? [
       // Post-March 31, 2025: Only these three scopes remain valid for Library API.
       // The deprecated photoslibrary, photoslibrary.readonly, and photoslibrary.sharing
       // scopes have been removed and will return 403 PERMISSION_DENIED.
@@ -82,7 +86,31 @@ const config = {
     port: parseInt(process.env.PORT || "3000", 10),
     /** Node environment (e.g., 'development', 'production') */
     env: process.env.NODE_ENV || "development",
+    /**
+     * Public base URL of this server (e.g. https://app.onrender.com).
+     * Used as the OAuth issuer URL for the MCP-transport bearer auth.
+     */
+    publicUrl: process.env.PUBLIC_URL || "",
+    /**
+     * Extra hostnames (comma-separated) allowed past DNS-rebinding protection,
+     * appended to the localhost defaults. Required for cloud hosts (e.g. Render).
+     */
+    allowedHosts: (process.env.ALLOWED_HOSTS ?? "")
+      .split(",")
+      .map((h) => h.trim())
+      .filter(Boolean),
+    /**
+     * Static bearer token gating the /mcp transport (Claude -> MCP).
+     * When set, /mcp requires `Authorization: Bearer <token>`.
+     */
+    mcpBearerToken: process.env.MCP_BEARER_TOKEN || "",
   },
+
+  /**
+   * Read-only mode. When true, write tools (album/media mutations) are hidden
+   * from tools/list and rejected in tools/call. Used for hardened cloud deploys.
+   */
+  readOnlyMode: process.env.READ_ONLY_MODE === "true",
 
   /**
    * MCP Server Configuration.

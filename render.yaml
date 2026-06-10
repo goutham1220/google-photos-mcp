@@ -1,0 +1,47 @@
+# Render Blueprint for a hardened, read-only, bearer-authenticated remote
+# Google Photos MCP server.
+#
+# Free plan => ephemeral filesystem (tokens.db is wiped on deploy/spin-down).
+# The GOOGLE_REFRESH_TOKEN env var re-seeds auth at boot (see src/auth/seedFromEnv.ts),
+# so persistence is not required.
+#
+# After the FIRST deploy, Render assigns the real *.onrender.com hostname.
+# Backfill it into ALLOWED_HOSTS, PUBLIC_URL, and GOOGLE_REDIRECT_URI, then redeploy.
+services:
+  - type: web
+    name: google-photos-mcp
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/index.js
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      # Backfill the three values below with the real host after the first deploy.
+      - key: ALLOWED_HOSTS
+        value: google-photos-mcp-xxxx.onrender.com
+      - key: PUBLIC_URL
+        value: https://google-photos-mcp-xxxx.onrender.com
+      - key: GOOGLE_REDIRECT_URI
+        value: https://google-photos-mcp-xxxx.onrender.com/auth/callback
+      - key: READ_ONLY_MODE
+        value: "true"
+      # Read-only consent: Library read (app-created) + Picker read.
+      - key: GOOGLE_OAUTH_SCOPES
+        value: https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata,https://www.googleapis.com/auth/photospicker.mediaitems.readonly
+      # Secrets — set in the Render dashboard (sync:false keeps them out of git).
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      # Read-only refresh token, minted locally (npm run print-refresh-token).
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      # Static bearer gating /mcp. Generate with: openssl rand -hex 32
+      - key: MCP_BEARER_TOKEN
+        sync: false

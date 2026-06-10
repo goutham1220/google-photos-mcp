@@ -57,6 +57,21 @@ import {
   pollPickerSessionSchema,
 } from "../schemas/toolSchemas.js";
 import { quotaManager } from "../utils/quotaManager.js";
+import config from "../utils/config.js";
+
+/**
+ * Tools that mutate the Google Photos library (create/upload/modify). These are
+ * hidden from tools/list and rejected in tools/call when READ_ONLY_MODE is on,
+ * so a hardened cloud deployment can run with a read-only Google token.
+ */
+const WRITE_TOOL_NAMES = new Set<string>([
+  "create_album",
+  "upload_media",
+  "add_media_to_album",
+  "add_album_enrichment",
+  "set_album_cover",
+  "create_album_with_media",
+]);
 
 /**
  * Formatted photo interfaces for MCP responses
@@ -236,8 +251,7 @@ export class GooglePhotosMCPCore {
    * Protected to allow subclasses to access
    */
   protected async handleListTools() {
-    return {
-      tools: [
+    const tools = [
         {
           name: "auth_status",
           description: "Check authentication status with Google Photos",
@@ -669,8 +683,12 @@ export class GooglePhotosMCPCore {
             properties: {},
           },
         },
-      ],
-    };
+    ];
+    // Hide write tools in read-only mode (hardened cloud deployment).
+    const visibleTools = config.readOnlyMode
+      ? tools.filter((t) => !WRITE_TOOL_NAMES.has(t.name))
+      : tools;
+    return { tools: visibleTools };
   }
 
   /**
@@ -678,6 +696,23 @@ export class GooglePhotosMCPCore {
    */
   protected async handleCallTool(request: CallToolRequest) {
     logger.info(`Handling tool request: ${request.params.name}`);
+
+    // Reject write tools in read-only mode before any auth/Google work, so the
+    // failure is a clear READ_ONLY_MODE message rather than an auth error.
+    if (config.readOnlyMode && WRITE_TOOL_NAMES.has(request.params.name)) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "READ_ONLY_MODE",
+              message: `Tool '${request.params.name}' is disabled: this server is running in read-only mode.`,
+            }),
+          },
+        ],
+      };
+    }
 
     // Get authentication tokens
     const tokens = await getFirstAvailableTokens();
