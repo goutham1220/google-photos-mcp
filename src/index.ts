@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import express, { Express } from "express";
+import express, { Express, RequestHandler } from "express";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomUUID } from "crypto";
@@ -11,6 +11,11 @@ import logger from "./utils/logger.js";
 import { quotaManager } from "./utils/quotaManager.js";
 import { healthChecker } from "./utils/healthCheck.js";
 import { GooglePhotosMCPCore } from "./mcp/core.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { StaticUserOAuthProvider } from "./mcpAuth.js";
+import { seedTokensFromEnv } from "./auth/seedFromEnv.js";
+import config from "./utils/config.js";
 
 // Load environment variables (quiet: true suppresses stdout messages that break STDIO MCP transport)
 dotenv.config({ quiet: true });
@@ -24,12 +29,25 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
   private app: Express;
   private transports = new Map<string, StreamableHTTPServerTransport>();
   private authCleanup?: () => void;
+  /** Hostnames permitted past DNS-rebinding protection (localhost + ALLOWED_HOSTS). */
+  private allowedHosts: string[];
 
   constructor() {
     super({
       name: "google-photos-mcp",
       version: "0.1.0",
     });
+
+    const port = process.env.PORT || "3000";
+    this.allowedHosts = [
+      `localhost:${port}`,
+      `127.0.0.1:${port}`,
+      `[::1]:${port}`,
+      "localhost",
+      "127.0.0.1",
+      "[::1]",
+      ...config.server.allowedHosts,
+    ];
 
     this.app = express();
     this.setupMiddleware();
@@ -40,23 +58,24 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
    * Sets up Express middleware including DNS rebinding protection
    */
   private setupMiddleware(): void {
+    // Trust the Render (or any reverse) proxy so req.protocol/host reflect the
+    // forwarded values rather than the internal hop.
+    this.app.set("trust proxy", 1);
     this.app.use(express.json());
 
+    // Liveness probe — unauthenticated and intentionally registered BEFORE the
+    // Host allow-list so platform health checks (e.g. Render) succeed even
+    // before ALLOWED_HOSTS is configured. Returns no sensitive data.
+    this.app.get("/healthz", (_req, res) => {
+      res.status(200).type("text/plain").send("ok");
+    });
+
     // DNS rebinding protection (MCP security requirement)
-    // Validates Host header to prevent malicious websites from accessing local server
+    // Validates Host header to prevent malicious websites from accessing the server.
+    // Localhost defaults plus any ALLOWED_HOSTS (e.g. the Render host) are permitted.
     this.app.use((req, res, next) => {
       const host = req.get("host");
-      const port = process.env.PORT || "3000";
-      const allowedHosts = [
-        `localhost:${port}`,
-        `127.0.0.1:${port}`,
-        `[::1]:${port}`,
-        "localhost",
-        "127.0.0.1",
-        "[::1]",
-      ];
-
-      if (host && !allowedHosts.includes(host)) {
+      if (host && !this.allowedHosts.includes(host)) {
         logger.warn(`Rejected request with invalid Host header: ${host}`);
         return res.status(403).send("Forbidden: Invalid Host header");
       }
@@ -71,6 +90,46 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
   private setupRoutes(): void {
     // Set up authentication routes
     this.authCleanup = setupAuthRoutes(this.app);
+
+    // --- MCP-transport bearer auth (Claude -> MCP) ---
+    // When MCP_BEARER_TOKEN is set, protect /mcp with a static bearer and mount
+    // the OAuth discovery/handshake routes claude.ai's connector expects. When
+    // unset (local dev), /mcp stays open — preserving current behavior. In
+    // production a bearer is REQUIRED.
+    const bearerToken = config.server.mcpBearerToken;
+    if (config.server.env === "production" && !bearerToken) {
+      throw new Error(
+        "SECURITY ERROR: MCP_BEARER_TOKEN must be set in production to protect the /mcp endpoint.",
+      );
+    }
+    const mcpGuards: RequestHandler[] = [];
+    if (bearerToken) {
+      const provider = new StaticUserOAuthProvider(bearerToken);
+      const port = process.env.PORT || "3000";
+      const publicUrl = config.server.publicUrl || `http://localhost:${port}`;
+      const issuerUrl = new URL(publicUrl);
+      this.app.use(
+        mcpAuthRouter({
+          provider,
+          issuerUrl,
+          resourceServerUrl: new URL("/mcp", issuerUrl),
+          scopesSupported: ["mcp"],
+          resourceName: "google-photos-mcp",
+        }),
+      );
+      const resourceMetadataUrl = new URL(
+        "/.well-known/oauth-protected-resource/mcp",
+        issuerUrl,
+      ).toString();
+      mcpGuards.push(
+        requireBearerAuth({ verifier: provider, resourceMetadataUrl }),
+      );
+      logger.info("MCP /mcp endpoint protected by static bearer token");
+    } else {
+      logger.warn(
+        "MCP_BEARER_TOKEN not set — /mcp is UNAUTHENTICATED (intended for local dev only).",
+      );
+    }
 
     // Home page
     this.app.get("/", (req, res) => {
@@ -123,7 +182,7 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
     });
 
     // Streamable HTTP endpoint for MCP communication (2025-06-18 spec)
-    this.app.post("/mcp", async (req, res) => {
+    this.app.post("/mcp", ...mcpGuards, async (req, res) => {
       try {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
         let transport: StreamableHTTPServerTransport | undefined;
@@ -138,6 +197,8 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
           // New session initialization
           const newTransport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
+            enableDnsRebindingProtection: true,
+            allowedHosts: this.allowedHosts,
             onsessioninitialized: (id) => {
               this.transports.set(id, newTransport);
               logger.info(`MCP session initialized: ${id}`);
@@ -181,7 +242,7 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
     });
 
     // GET endpoint for Streamable HTTP (required by spec)
-    this.app.get("/mcp", async (req, res) => {
+    this.app.get("/mcp", ...mcpGuards, async (req, res) => {
       const sessionId = req.headers["mcp-session-id"] as string;
       const transport = this.transports.get(sessionId);
 
@@ -193,7 +254,7 @@ class GooglePhotosHTTPServer extends GooglePhotosMCPCore {
     });
 
     // DELETE endpoint for session cleanup (required by spec)
-    this.app.delete("/mcp", async (req, res) => {
+    this.app.delete("/mcp", ...mcpGuards, async (req, res) => {
       const sessionId = req.headers["mcp-session-id"] as string;
       const transport = this.transports.get(sessionId);
 
@@ -270,6 +331,10 @@ async function main() {
     // In STDIO mode, all logging must go to stderr to avoid breaking the MCP protocol
     logger.info("Starting Google Photos MCP server in STDIO mode");
 
+    // Seed a refresh token from GOOGLE_REFRESH_TOKEN if the store is empty
+    // (harmless locally; primarily for ephemeral cloud filesystems).
+    await seedTokensFromEnv();
+
     // Check token existence
     try {
       const tokens = await getFirstAvailableTokens();
@@ -314,6 +379,11 @@ async function main() {
     });
 
     const port = parseInt(process.env.PORT || "3000", 10);
+
+    // Seed a refresh token from GOOGLE_REFRESH_TOKEN before serving, so the
+    // first tool call can mint an access token even on an ephemeral filesystem.
+    await seedTokensFromEnv();
+
     await httpServer.start(port);
   }
 }

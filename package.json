@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "dev": "node --loader ts-node/esm src/index.ts",
     "stdio": "node dist/index.js --stdio",
+    "print-refresh-token": "node --loader ts-node/esm scripts/print-refresh-token.ts",
     "lint": "eslint .",
     "format": "prettier --write \"src/**/*.ts\"",
     "test": "NODE_OPTIONS='--no-warnings=DeprecationWarning' vitest run",
